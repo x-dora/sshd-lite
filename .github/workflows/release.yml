@@ -1,0 +1,60 @@
+# 交叉编译静态二进制并发布到 GitHub Release。
+#
+# 产物名固定为 sshd-lite-linux-<arch>，下游脚本用 releases/latest/download 直接拉取，
+# 全局 tag 固定为 latest，每次都覆盖同一个 release，保证下载地址长期稳定。
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'main.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build static binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" \
+              -o "dist/sshd-lite-linux-${arch}" .
+          done
+          ls -la dist
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum sshd-lite-linux-* > checksums.txt
+          cat checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: sshd-lite (latest)
+          files: dist/*
+          make_latest: true
