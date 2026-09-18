@@ -22,19 +22,37 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
+	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 )
 
 const (
-	envListen     = "SSH_LISTEN"
-	envHostKey    = "SSH_HOST_KEY_FILE"
-	envKeysFile   = "SSH_AUTHORIZED_KEYS_FILE"
-	envKeysInline = "SSH_AUTHORIZED_KEYS"
-	envShell      = "SSH_SHELL"
+	envListen         = "SSH_LISTEN"
+	envHostKey        = "SSH_HOST_KEY_FILE"
+	envKeysFile       = "SSH_AUTHORIZED_KEYS_FILE"
+	envKeysInline     = "SSH_AUTHORIZED_KEYS"
+	envShell          = "SSH_SHELL"
+	envIdleTimeout    = "SSH_IDLE_TIMEOUT"
+	envMaxTimeout     = "SSH_MAX_TIMEOUT"
+	envMaxConnections = "SSH_MAX_CONNECTIONS"
+)
+
+// 默认值按 PaaS 容器（内存百来 MiB、CPU 不到一核）取：每个空闲会话都占着一个
+// goroutine、一个 pty 和一块缓冲，需要兜底回收；但正常交互和跑得久的长任务
+// 不能被误伤，所以空闲超时取得够长，会话最大时长默认不限，连接数上限只拦
+// 真正的异常堆积。三项都可以用 0 关掉。
+const (
+	defaultIdleTimeout    = 30 * time.Minute
+	defaultMaxTimeout     = 0
+	defaultMaxConnections = 32
 )
 
 func main() {
@@ -51,6 +69,12 @@ func main() {
 		"直接给出公钥内容，多个用换行或字面量 \\n 分隔（env "+envKeysInline+"）")
 	shellPath := flag.String("shell", os.Getenv(envShell),
 		"登录后启动的 shell（env "+envShell+"）")
+	idleTimeout := flag.Duration("idle-timeout", durationEnv(envIdleTimeout, defaultIdleTimeout),
+		"会话空闲多久后断开，0 表示不限（env "+envIdleTimeout+"）")
+	maxTimeout := flag.Duration("max-timeout", durationEnv(envMaxTimeout, defaultMaxTimeout),
+		"单个会话最长存活时间，0 表示不限（env "+envMaxTimeout+"）")
+	maxConnections := flag.Int("max-connections", intEnv(envMaxConnections, defaultMaxConnections),
+		"并发连接上限，0 表示不限（env "+envMaxConnections+"）")
 	flag.Parse()
 
 	signer, err := loadOrCreateHostKey(*hostKeyPath)
@@ -65,6 +89,10 @@ func main() {
 
 	shell := resolveShell(*shellPath)
 
+	// 连接计数由 ConnCallback 维护，用包装过的 net.Conn 在 Close 时释放，
+	// 这样转发连接、认证中途掉线等异常路径也不会把额度泄漏掉。
+	var activeConns atomic.Int64
+
 	server := &ssh.Server{
 		Addr:    *listen,
 		Handler: sessionHandler(shell),
@@ -77,10 +105,37 @@ func main() {
 		// （通常只绑回环，再由前置代理对外暴露）。
 		LocalPortForwardingCallback:   func(ssh.Context, string, uint32) bool { return true },
 		ReversePortForwardingCallback: func(ssh.Context, string, uint32) bool { return true },
+
+		IdleTimeout: *idleTimeout,
+		MaxTimeout:  *maxTimeout,
+
+		// 连接数上限只能靠 ConnCallback 实现（Server 没有对应字段）：返回 nil
+		// 即拒绝该连接。超限时先写一行说明再关，否则客户端只会看到连接被重置。
+		ConnCallback: func(_ ssh.Context, conn net.Conn) net.Conn {
+			if *maxConnections <= 0 {
+				return conn
+			}
+			if activeConns.Add(1) > int64(*maxConnections) {
+				activeConns.Add(-1)
+				_, _ = fmt.Fprintf(conn, "sshd-lite: 连接数已达上限 %d\r\n", *maxConnections)
+				return nil
+			}
+			return &countedConn{Conn: conn, release: func() { activeConns.Add(-1) }}
+		},
+
+		// sftp 子系统必须由本进程实现，不能交给系统二进制：OpenSSH 9.0 起 scp
+		// 默认改走 SFTP 协议，而容器以 /etc/passwd 里不存在的 uid 运行时，
+		// /usr/bin/scp 和 sftp-server 自己就会在 getpwnam 上失败（实测报
+		// "scp: unknown user 999"）。这正是 sshd-lite 要绕开的那个问题。
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+			"sftp": sftpHandler,
+		},
 	}
 	server.AddHostKey(signer)
 
 	log.Printf("listening on %s, shell=%s, %d authorized key(s)", *listen, shell, len(keys))
+	log.Printf("idle-timeout=%s max-timeout=%s max-connections=%d (0 = 不限)",
+		durationLabel(*idleTimeout), durationLabel(*maxTimeout), *maxConnections)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Fatalf("serve: %v", err)
 	}
@@ -91,6 +146,77 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// durationEnv 解析时长配置：接受 Go duration 字符串（"30m"、"1h30m"）或纯秒数。
+// 解析失败只给警告并退回默认值——一处拼错的超时配置不该让服务起不来。
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	log.Printf("WARN: 无法解析 %s=%q，改用默认值 %s", key, raw, durationLabel(fallback))
+	return fallback
+}
+
+func intEnv(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		log.Printf("WARN: 无法解析 %s=%q，改用默认值 %d", key, raw, fallback)
+		return fallback
+	}
+	return n
+}
+
+func durationLabel(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	return d.String()
+}
+
+// countedConn 在连接关闭时释放配额。sync.Once 保证计数不会被减成负数——
+// net.Conn 的 Close 允许多次调用，转发链路里也确实会重复关闭。
+type countedConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *countedConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
+}
+
+// sftpHandler 在会话上跑一个 SFTP 服务端，供 sftp 与本机 scp（OpenSSH 9.0+
+// 默认协议）使用。它直接以当前进程身份读写文件系统，不查用户数据库，所以
+// 虚拟 uid 环境下也能正常工作——而系统自带的 scp/sftp-server 会在 getpwnam
+// 上直接失败。
+func sftpHandler(s ssh.Session) {
+	srv, err := sftp.NewServer(s)
+	if err != nil {
+		fmt.Fprintln(s.Stderr(), "sshd-lite: 无法启动 sftp:", err)
+		_ = s.Exit(1)
+		return
+	}
+	defer srv.Close()
+
+	if err := srv.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintln(s.Stderr(), "sshd-lite: sftp:", err)
+		_ = s.Exit(1)
+		return
+	}
+	_ = s.Exit(0)
 }
 
 // resolveShell 依次尝试显式配置、用户登录 shell、常见 shell，最后退回 /bin/sh。
