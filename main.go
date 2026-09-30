@@ -34,6 +34,10 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
+// version 是构建时注入的版本号：release 工作流用 -ldflags "-X main.version=..." 把
+// VERSION 文件的内容写进来。直接 go build 得到的是 dev。
+var version = "dev"
+
 const (
 	envListen         = "SSH_LISTEN"
 	envHostKey        = "SSH_HOST_KEY_FILE"
@@ -78,7 +82,13 @@ func main() {
 		"单个会话最长存活时间，0 表示不限（env "+envMaxTimeout+"）")
 	maxConnections := flag.Int("max-connections", intEnv(envMaxConnections, defaultMaxConnections),
 		"并发连接上限，0 表示不限（env "+envMaxConnections+"）")
+	showVersion := flag.Bool("version", false, "打印版本后退出")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("sshd-lite %s\n", version)
+		return
+	}
 
 	signers, err := loadOrCreateHostKeys(*hostKeyPath, *hostKeySeed)
 	if err != nil {
@@ -179,7 +189,8 @@ func main() {
 		_ = server.Close()
 	}()
 
-	log.Printf("listening on %s, shell=%s, %d authorized key(s)", *listen, shell, len(keys))
+	log.Printf("sshd-lite %s listening on %s, shell=%s, %d authorized key(s)",
+		version, *listen, shell, len(keys))
 	log.Printf("idle-timeout=%s max-timeout=%s max-connections=%d (0 = 不限)",
 		durationLabel(*idleTimeout), durationLabel(*maxTimeout), *maxConnections)
 	if err := server.ListenAndServe(); err != nil &&
