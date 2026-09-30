@@ -11,9 +11,6 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,10 +19,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
+	"os/user"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -37,6 +37,7 @@ import (
 const (
 	envListen         = "SSH_LISTEN"
 	envHostKey        = "SSH_HOST_KEY_FILE"
+	envHostKeySeed    = "SSH_HOST_KEY_SEED"
 	envKeysFile       = "SSH_AUTHORIZED_KEYS_FILE"
 	envKeysInline     = "SSH_AUTHORIZED_KEYS"
 	envShell          = "SSH_SHELL"
@@ -63,6 +64,8 @@ func main() {
 		"监听地址（env "+envListen+"）")
 	hostKeyPath := flag.String("host-key", os.Getenv(envHostKey),
 		"host key 文件路径，不存在则生成；留空表示每次启动重新生成（env "+envHostKey+"）")
+	hostKeySeed := flag.String("host-key-seed", os.Getenv(envHostKeySeed),
+		"host key 种子；设置后由它派生 host key，不读写任何文件（env "+envHostKeySeed+"）")
 	keysFile := flag.String("authorized-keys", os.Getenv(envKeysFile),
 		"authorized_keys 文件路径（env "+envKeysFile+"）")
 	keysInline := flag.String("authorized-keys-inline", os.Getenv(envKeysInline),
@@ -77,7 +80,7 @@ func main() {
 		"并发连接上限，0 表示不限（env "+envMaxConnections+"）")
 	flag.Parse()
 
-	signer, err := loadOrCreateHostKey(*hostKeyPath)
+	signers, err := loadOrCreateHostKeys(*hostKeyPath, *hostKeySeed)
 	if err != nil {
 		log.Fatalf("host key: %v", err)
 	}
@@ -86,6 +89,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("authorized keys: %v", err)
 	}
+	warnFromRestrictions(keys)
 
 	shell := resolveShell(*shellPath)
 
@@ -93,18 +97,46 @@ func main() {
 	// 这样转发连接、认证中途掉线等异常路径也不会把额度泄漏掉。
 	var activeConns atomic.Int64
 
+	// 端口转发必须显式注册：gliderlabs 的 DefaultChannelHandlers 只有 "session"、
+	// DefaultRequestHandlers 是空 map，不注册的话 -L/-R/-D 一律以
+	// "unknown channel type" 被拒，下面两个 Callback 永远轮不到执行。
+	fwdHandler := &ssh.ForwardedTCPHandler{}
+
 	server := &ssh.Server{
 		Addr:    *listen,
 		Handler: sessionHandler(shell),
 		// 认证只看公钥，不看用户名——客户端用 root、user 还是 uid 数字都等价。
-		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) bool {
-			_, ok := keys[string(key.Marshal())]
-			return ok
+		// 命中公钥后把那一行的选项挂到连接上下文上，会话与转发都按它来。
+		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
+			opts, ok := keys[string(key.Marshal())]
+			if !ok {
+				return false
+			}
+			if !opts.allowsFrom(ctx.RemoteAddr()) {
+				log.Printf("拒绝连接：来源 %v 不在该公钥的 from= 列表内", ctx.RemoteAddr())
+				return false
+			}
+			ctx.SetValue(authOptionsKey{}, opts)
+			return true
 		},
-		// ssh -L/-R/-D 是本工具的主要用途之一，默认全部放行；可达性由部署方控制
-		// （通常只绑回环，再由前置代理对外暴露）。
-		LocalPortForwardingCallback:   func(ssh.Context, string, uint32) bool { return true },
-		ReversePortForwardingCallback: func(ssh.Context, string, uint32) bool { return true },
+		// 这两个 handler 必须自己塞进去，否则端口转发通道/请求没人应答。
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": ssh.DirectTCPIPHandler,
+		},
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forceLoopbackBind(fwdHandler.HandleSSHRequest),
+			"cancel-tcpip-forward": forceLoopbackBind(fwdHandler.HandleSSHRequest),
+		},
+		// ssh -L/-D 的目标不限，可达性由部署方控制（通常只绑回环，再由前置代理
+		// 对外暴露）；被 authorized_keys 的 no-port-forwarding/restrict 关掉时拒绝。
+		LocalPortForwardingCallback: func(ctx ssh.Context, _ string, _ uint32) bool {
+			return !optionsOf(ctx).noForward
+		},
+		// -R 的绑定地址由 forceLoopbackBind 收敛到回环，这里只管开关。
+		ReversePortForwardingCallback: func(ctx ssh.Context, _ string, _ uint32) bool {
+			return !optionsOf(ctx).noForward
+		},
 
 		IdleTimeout: *idleTimeout,
 		MaxTimeout:  *maxTimeout,
@@ -131,12 +163,27 @@ func main() {
 			"sftp": sftpHandler,
 		},
 	}
-	server.AddHostKey(signer)
+	for _, signer := range signers {
+		server.AddHostKey(signer)
+	}
+
+	// 交互式会话跑在 pty 里，而 creack/pty 的 Start 会给子进程 Setsid：每个会话
+	// 自成一个会话和进程组，既收不到本进程退出时的 SIGHUP，也不和本进程同组，
+	// 容器 init 的进程组转发同样够不着。不显式回收，节点重启就会留下一堆还在跑的
+	// shell，所以这里自己接管 SIGTERM/SIGINT。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		log.Printf("收到 %s，回收 %d 个会话后退出", <-sigCh, sessions.count())
+		sessions.terminate()
+		_ = server.Close()
+	}()
 
 	log.Printf("listening on %s, shell=%s, %d authorized key(s)", *listen, shell, len(keys))
 	log.Printf("idle-timeout=%s max-timeout=%s max-connections=%d (0 = 不限)",
 		durationLabel(*idleTimeout), durationLabel(*maxTimeout), *maxConnections)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err := server.ListenAndServe(); err != nil &&
+		!errors.Is(err, net.ErrClosed) && !errors.Is(err, ssh.ErrServerClosed) {
 		log.Fatalf("serve: %v", err)
 	}
 }
@@ -198,6 +245,109 @@ func (c *countedConn) Close() error {
 	return c.Conn.Close()
 }
 
+// sessionShutdownGrace 是退出时留给会话自行收尾的时间。
+const sessionShutdownGrace = 3 * time.Second
+
+// sessionRegistry 记录正在运行的会话进程，用于退出时整组回收。
+//
+// 登记的是会话进程的 pid，它同时也是该会话的进程组 id：pty 分支由 creack/pty 设
+// Setsid 拿到，非 pty 分支由 prepareSession 设 Setpgid 拿到。
+type sessionRegistry struct {
+	mu   sync.Mutex
+	pids map[int]struct{}
+}
+
+var sessions = &sessionRegistry{pids: map[int]struct{}{}}
+
+func (r *sessionRegistry) add(pid int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pids[pid] = struct{}{}
+}
+
+func (r *sessionRegistry) remove(pid int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.pids, pid)
+}
+
+func (r *sessionRegistry) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.pids)
+}
+
+// terminate 先 SIGHUP 再 SIGKILL 回收所有会话进程组。只杀会话进程本身是不够的：
+// shell 退出未必带走自己的子孙，而且这些会话都自成进程组，父进程组收到的信号
+// 传不到它们，只有按组通知才能覆盖到整棵进程树。
+func (r *sessionRegistry) terminate() {
+	r.mu.Lock()
+	pids := make([]int, 0, len(r.pids))
+	for pid := range r.pids {
+		pids = append(pids, pid)
+	}
+	r.mu.Unlock()
+
+	if len(pids) == 0 {
+		return
+	}
+	for _, pid := range pids {
+		terminateGroup(pid)
+	}
+	deadline := time.Now().Add(sessionShutdownGrace)
+	for time.Now().Before(deadline) {
+		if r.count() == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for _, pid := range pids {
+		killGroup(pid)
+	}
+}
+
+// forceLoopbackBind 把 -R 的绑定地址收敛到回环地址，复刻 OpenSSH 默认的
+// GatewayPorts=no 语义：客户端显式写通配地址会被拒，留空（OpenSSH 客户端最常见
+// 的写法）则改写成 127.0.0.1——gliderlabs 会把空地址交给 net.Listen(":port")，
+// 那等于监听所有接口，和「默认只绑回环」的承诺直接冲突。
+//
+// 只做 allow/deny 是做不到这一点的（回调拿不到改写结果），所以这里改写请求负载
+// 再交给上游 handler；调用方 handleRequests 用的是原来的 req 去 Reply，替换安全。
+func forceLoopbackBind(inner ssh.RequestHandler) ssh.RequestHandler {
+	return func(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
+		var payload struct {
+			BindAddr string
+			BindPort uint32
+		}
+		if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
+			return false, nil
+		}
+		switch {
+		case payload.BindAddr == "":
+			payload.BindAddr = "127.0.0.1"
+		case !isLoopbackHost(payload.BindAddr):
+			log.Printf("拒绝 -R 绑定到 %q：只允许回环地址", payload.BindAddr)
+			return false, []byte("sshd-lite: 反向转发只允许绑定回环地址")
+		}
+		normalized := &gossh.Request{
+			Type:      req.Type,
+			WantReply: req.WantReply,
+			Payload:   gossh.Marshal(&payload),
+		}
+		return inner(ctx, srv, normalized)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // sftpHandler 在会话上跑一个 SFTP 服务端，供 sftp 与本机 scp（OpenSSH 9.0+
 // 默认协议）使用。它直接以当前进程身份读写文件系统，不查用户数据库，所以
 // 虚拟 uid 环境下也能正常工作——而系统自带的 scp/sftp-server 会在 getpwnam
@@ -232,51 +382,117 @@ func resolveShell(explicit string) string {
 	return "/bin/sh"
 }
 
-// loadOrCreateHostKey 优先读取既有 host key；缺失时生成 ed25519，并在给出路径时
-// 写回磁盘，避免每次重启 host key 变化导致客户端报 host key 已改变。
-func loadOrCreateHostKey(path string) (gossh.Signer, error) {
-	if path != "" {
-		data, err := os.ReadFile(path)
-		switch {
-		case err == nil:
-			signer, err := gossh.ParsePrivateKey(data)
+// authOptionsKey 是连接上下文里存放 authorized_keys 选项的键：认证通过时写入，
+// 会话处理与端口转发回调再取出来。
+type authOptionsKey struct{}
+
+// keyOptions 是 authorized_keys 行首的选项里 sshd-lite 需要落实的部分。
+//
+// 这些选项以前被整个丢掉了：写了 from= 以为限了来源、写了 command= 以为锁了命令，
+// 实际什么都没发生——安全预期落空比不支持更危险。现在能落实的落实，落实不了的
+// 启动时直接报错，不留静默失效的余地。
+type keyOptions struct {
+	command   string       // command=：强制执行的命令，优先于客户端请求的命令
+	from      []*net.IPNet // from=：允许的来源，空表示不限
+	noPTY     bool         // no-pty / restrict
+	noForward bool         // no-port-forwarding / restrict
+}
+
+// allowsFrom 判断来源地址是否在 from= 列表内。比较的是 sshd-lite 看到的对端地址：
+// 部署在前置代理之后时那是代理的地址，不是真实客户端 IP。
+func (o keyOptions) allowsFrom(addr net.Addr) bool {
+	if len(o.from) == 0 || addr == nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, network := range o.from {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func optionsOf(ctx ssh.Context) keyOptions {
+	opts, _ := ctx.Value(authOptionsKey{}).(keyOptions)
+	return opts
+}
+
+// parseKeyOptions 解析一行 authorized_keys 的选项。
+func parseKeyOptions(options []string) (keyOptions, error) {
+	var opts keyOptions
+	for _, raw := range options {
+		name, value, _ := strings.Cut(raw, "=")
+		switch name {
+		case "restrict":
+			opts.noPTY, opts.noForward = true, true
+		case "no-pty":
+			opts.noPTY = true
+		case "no-port-forwarding":
+			opts.noForward = true
+		case "no-agent-forwarding", "no-X11-forwarding", "no-user-rc":
+			// 这三项限制的能力 sshd-lite 本来就没有，等同已经满足。
+		case "command":
+			opts.command = strings.Trim(value, `"`)
+		case "from":
+			networks, err := parseFromList(strings.Trim(value, `"`))
 			if err != nil {
-				return nil, fmt.Errorf("parse %s: %w", path, err)
+				return keyOptions{}, err
 			}
-			return signer, nil
-		case !errors.Is(err, os.ErrNotExist):
-			return nil, err
+			opts.from = append(opts.from, networks...)
+		default:
+			return keyOptions{}, fmt.Errorf("不支持 authorized_keys 选项 %q", name)
 		}
 	}
+	return opts, nil
+}
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
+func parseFromList(list string) ([]*net.IPNet, error) {
+	var networks []*net.IPNet
+	for _, item := range strings.Split(list, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if ip := net.ParseIP(item); ip != nil {
+			bits := 128
+			if ipv4 := ip.To4(); ipv4 != nil {
+				ip, bits = ipv4, 32
+			}
+			networks = append(networks, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		if _, network, err := net.ParseCIDR(item); err == nil {
+			networks = append(networks, network)
+			continue
+		}
+		return nil, fmt.Errorf("from= 中的 %q 既不是 IP 也不是 CIDR", item)
 	}
-	signer, err := gossh.NewSignerFromKey(priv)
-	if err != nil {
-		return nil, err
-	}
+	return networks, nil
+}
 
-	if path != "" {
-		if err := writeHostKey(path, priv); err != nil {
-			log.Printf("WARN: host key 无法写入 %s: %v（重启后 host key 会变化）", path, err)
+// warnFromRestrictions 提前把 from= 的坑说清楚：它比较的是 sshd-lite 看到的对端
+// 地址，经前置代理转发时那是代理的回环地址，写了 from= 会把所有连接都挡在外面。
+func warnFromRestrictions(keys map[string]keyOptions) {
+	for _, opts := range keys {
+		if len(opts.from) > 0 {
+			log.Printf("WARN: 有公钥配置了 from= 限制；sshd-lite 只能看到对端地址，" +
+				"经前置代理转发时会拒绝所有连接")
+			return
 		}
 	}
-	return signer, nil
 }
 
-func writeHostKey(path string, priv ed25519.PrivateKey) error {
-	block, err := gossh.MarshalPrivateKey(priv, "")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, pem.EncodeToMemory(block), 0o600)
-}
-
-// loadAuthorizedKeys 从文件或内联内容读取公钥。两者都为空时直接报错，避免起一个
-// 谁都进不来的空服务端。
-func loadAuthorizedKeys(file, inline string) (map[string]struct{}, error) {
+// loadAuthorizedKeys 从文件或内联内容读取公钥，连同每行的选项一起返回。两者都
+// 为空时直接报错，避免起一个谁都进不来的空服务端。
+func loadAuthorizedKeys(file, inline string) (map[string]keyOptions, error) {
 	var raw []byte
 	switch {
 	case inline != "":
@@ -291,9 +507,9 @@ func loadAuthorizedKeys(file, inline string) (map[string]struct{}, error) {
 		return nil, errors.New("未提供 authorized keys")
 	}
 
-	keys := make(map[string]struct{})
+	keys := make(map[string]keyOptions)
 	for len(raw) > 0 {
-		pub, _, _, rest, err := gossh.ParseAuthorizedKey(raw)
+		pub, _, options, rest, err := gossh.ParseAuthorizedKey(raw)
 		if err != nil {
 			// 注释与空行由 ParseAuthorizedKey 自行跳过，剩余内容解析失败说明
 			// 配置有误，直接报出来比静默忽略更安全。
@@ -302,7 +518,11 @@ func loadAuthorizedKeys(file, inline string) (map[string]struct{}, error) {
 			}
 			return nil, fmt.Errorf("解析公钥失败: %w", err)
 		}
-		keys[string(pub.Marshal())] = struct{}{}
+		opts, err := parseKeyOptions(options)
+		if err != nil {
+			return nil, fmt.Errorf("公钥选项 %v: %w", options, err)
+		}
+		keys[string(pub.Marshal())] = opts
 		raw = rest
 	}
 	if len(keys) == 0 {
@@ -313,24 +533,33 @@ func loadAuthorizedKeys(file, inline string) (map[string]struct{}, error) {
 
 func sessionHandler(shell string) ssh.Handler {
 	return func(s ssh.Session) {
-		if raw := s.RawCommand(); raw != "" {
+		opts := optionsOf(s.Context())
+		raw := s.RawCommand()
+		// command= 覆盖客户端请求的命令（客户端压根没请求命令时也照样执行它），
+		// 与 OpenSSH 的强制命令语义一致。
+		if opts.command != "" {
+			raw = opts.command
+		}
+		if raw != "" {
 			runCommand(s, shell, raw)
 			return
 		}
-		runShell(s, shell)
+		runShell(s, opts, shell)
 	}
 }
 
-func runShell(s ssh.Session, shell string) {
+func runShell(s ssh.Session, opts keyOptions, shell string) {
 	ptyReq, winCh, hasPty := s.Pty()
+	// no-pty 时按无终端会话处理：命令照跑，只是不分配 pty。
+	if opts.noPTY {
+		hasPty = false
+	}
 	cmd := exec.Command(shell)
 	cmd.Env = sessionEnv(s, ptyReq.Term, hasPty)
 
 	if !hasPty {
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = s, s, s.Stderr()
-		if err := cmd.Run(); err != nil {
-			reportExit(s, "shell", err)
-		}
+		runTracked(s, "shell", cmd)
 		return
 	}
 
@@ -341,6 +570,10 @@ func runShell(s ssh.Session, shell string) {
 		return
 	}
 	defer f.Close()
+
+	// pty.Start 已经让子进程 Setsid，它自己就是进程组组长，直接按 pid 登记。
+	sessions.add(cmd.Process.Pid)
+	defer sessions.remove(cmd.Process.Pid)
 
 	go func() {
 		for win := range winCh {
@@ -355,6 +588,23 @@ func runShell(s ssh.Session, shell string) {
 	_ = cmd.Wait()
 }
 
+// runTracked 启动命令并登记它的进程组，好在退出时统一回收；启动或等待失败都按
+// sshd 的习惯把退出码报给客户端，并把错误原样返回给调用方判断是否已上报。
+func runTracked(s ssh.Session, what string, cmd *exec.Cmd) error {
+	prepareSession(cmd)
+	if err := cmd.Start(); err != nil {
+		reportExit(s, what, err)
+		return err
+	}
+	sessions.add(cmd.Process.Pid)
+	err := cmd.Wait()
+	sessions.remove(cmd.Process.Pid)
+	if err != nil {
+		reportExit(s, what, err)
+	}
+	return err
+}
+
 // runCommand 与 sshd 保持同样的语义：整条命令字符串交给登录 shell 的 -c 执行，
 // 这样 `ls | grep x`、`a && b` 这类 shell 语法才能正常工作（直接 exec.Command 拆
 // 参数会让分号、管道全部失效）。
@@ -363,11 +613,9 @@ func runCommand(s ssh.Session, shell, raw string) {
 	cmd.Env = sessionEnv(s, "", false)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = s, s, s.Stderr()
 
-	if err := cmd.Run(); err != nil {
-		reportExit(s, raw, err)
-		return
+	if runTracked(s, raw, cmd) == nil {
+		_ = s.Exit(0)
 	}
-	_ = s.Exit(0)
 }
 
 // sessionEnv 沿用服务端进程的环境：容器里没有登录会话那一套初始化，直接用父进程
@@ -380,10 +628,30 @@ func sessionEnv(s ssh.Session, term string, hasPty bool) []string {
 	if addr := s.RemoteAddr(); addr != nil {
 		env = append(env, "SSH_CONNECTION="+addr.String())
 	}
-	if user := s.User(); user != "" {
-		env = append(env, "USER="+user, "LOGNAME="+user)
+
+	// USER/LOGNAME 不再写客户端填的用户名：那是客户端完全可控的任意字符串，而
+	// $USER 是被脚本普遍信任的变量，拿它覆盖真实身份会误导这些脚本（真实 uid 还
+	// 可能根本不在 /etc/passwd 里）。父进程设了就保留，否则用本进程的真实身份
+	// 兜底；客户端填的名字改用 SSH_LOGIN_USER 暴露，需要时照样读得到。
+	if os.Getenv("USER") == "" {
+		if name := currentUserName(); name != "" {
+			env = append(env, "USER="+name, "LOGNAME="+name)
+		}
+	}
+	if loginUser := s.User(); loginUser != "" {
+		env = append(env, "SSH_LOGIN_USER="+loginUser)
 	}
 	return env
+}
+
+// currentUserName 取本进程的真实用户名。容器以虚拟 uid 运行时 /etc/passwd 里没有
+// 对应条目，这里就返回空——宁可不设，也不编一个假名字出来。
+func currentUserName() string {
+	current, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return current.Username
 }
 
 func reportExit(s ssh.Session, what string, err error) {
