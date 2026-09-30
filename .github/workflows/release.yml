@@ -9,7 +9,9 @@ on:
   push:
     branches: [main]
     paths:
-      - 'main.go'
+      # 逐个列文件容易漏：新增 .go 文件后只改那个文件就不会触发发布，main 与线上
+      # 二进制会静默脱节。按后缀匹配，任何 Go 源码变更都重新发布。
+      - '**.go'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/release.yml'
