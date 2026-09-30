@@ -51,6 +51,8 @@ ssh -p 2222 root@example.com
 ssh -p 2222 user@example.com
 ```
 
+`-version` 打印版本号后退出，启动日志里也会带上它，方便确认节点上装的是哪一版。
+
 ### 配置项
 
 环境变量与同名命令行参数等价，环境变量优先用于容器部署；命令行参数优先级更高。
@@ -128,9 +130,17 @@ ssh 会话沿用服务端进程的环境，另外补上：
 
 ## 构建
 
+版本号取自仓库根目录的 `VERSION`，发布时用 `-ldflags` 注入；直接 `go build` 得到的是 `dev`。
+
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o sshd-lite .
+VERSION="$(tr -d '[:space:]' < VERSION)"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+  -ldflags "-s -w -X main.version=${VERSION}" -o sshd-lite .
 ```
+
+推 `v<VERSION>` tag 触发 Release 工作流，发布 amd64/arm64 静态二进制与 `checksums.txt`。
+`releases/latest/download/<asset>` 始终指向最新一条 release，所以下游不用跟着版本号改；
+[rw-node](https://github.com/x-dora/rw-node) 用 `.sshd-lite-version` 钉住具体版本。
 
 ## 许可证
 

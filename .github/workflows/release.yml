@@ -1,20 +1,19 @@
 # 交叉编译静态二进制并发布到 GitHub Release。
 #
-# 产物名固定为 sshd-lite-linux-<arch>，下游脚本用 releases/latest/download 直接拉取，
-# 全局 tag 固定为 latest，每次都覆盖同一个 release，保证下载地址长期稳定。
+# 版本号来自仓库根目录的 VERSION，推 v<VERSION> tag 触发（与 rw-node-front 一致）。
+# 产物名固定为 sshd-lite-linux-<arch>，并把最新一条始终标成 latest，所以
+# releases/latest/download/<asset> 这个地址长期有效，下游脚本不必跟着版本号改。
 name: Release
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
-    paths:
-      # 逐个列文件容易漏：新增 .go 文件后只改那个文件就不会触发发布，main 与线上
-      # 二进制会静默脱节。按后缀匹配，任何 Go 源码变更都重新发布。
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/release.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -35,13 +34,34 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            tag="${{ github.ref_name }}"
+            # tag 与 VERSION 对不上，等于把新二进制挂到别的版本号下，宁可失败也别发错。
+            if [[ "$tag" != "v$file_version" ]]; then
+              echo "::error::tag $tag 与 VERSION v$file_version 不一致"
+              exit 1
+            fi
+          else
+            tag="v$file_version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$file_version" >> "$GITHUB_OUTPUT"
+
       - name: Build static binaries
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-              go build -trimpath -ldflags "-s -w" \
+              go build -trimpath \
+              -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }}" \
               -o "dist/sshd-lite-linux-${arch}" .
           done
           ls -la dist
@@ -56,7 +76,15 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: sshd-lite (latest)
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: sshd-lite ${{ steps.version.outputs.tag }}
           files: dist/*
           make_latest: true
+          body: |
+            ## Assets
+
+            - `sshd-lite-linux-amd64` — linux/amd64
+            - `sshd-lite-linux-arm64` — linux/arm64
+            - `checksums.txt` — 上面两个二进制的 sha256
+
+            由 [rw-node](https://github.com/x-dora/rw-node) 通过 `.sshd-lite-version` 引用。
